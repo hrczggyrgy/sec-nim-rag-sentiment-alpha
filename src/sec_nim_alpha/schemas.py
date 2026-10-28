@@ -167,9 +167,11 @@ class SentimentResult:
     negative_ratio: float
     neutral_ratio: float
     analyzed_sentences: int
-    section_coverage: dict[str, int]
-    backend: str
-    model_version: str
+    eligible_sentences: int = 0
+    section_coverage: dict[str, int] = field(default_factory=dict)
+    section_sentiment: Optional[dict[str, dict[str, float]]] = None
+    backend: str = ""
+    model_version: str = ""
     top_bullish_sentence: Optional[str] = None
     top_bearish_sentence: Optional[str] = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
@@ -181,7 +183,9 @@ class SentimentResult:
             "negative_ratio": self.negative_ratio,
             "neutral_ratio": self.neutral_ratio,
             "analyzed_sentences": self.analyzed_sentences,
+            "eligible_sentences": self.eligible_sentences,
             "section_coverage": self.section_coverage,
+            "section_sentiment": self.section_sentiment,
             "backend": self.backend,
             "model_version": self.model_version,
             "top_bullish_sentence": self.top_bullish_sentence,

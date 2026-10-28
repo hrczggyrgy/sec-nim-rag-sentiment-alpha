@@ -145,115 +145,354 @@ def compute_claim_level_support(answer: str, context_chunks: list[str]) -> dict[
     }
 
 
-def create_sentiment_volatility_figure(metrics_df: pd.DataFrame) -> go.Figure:
-    """Creates a dual-axis Plotly chart comparing Management Optimism Index vs Post-Filing Volatility."""
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # Handle missing/NaN sentiment values gracefully
+def create_sentiment_volatility_figure(
+    metrics_df: pd.DataFrame,
+    backend: str = "unknown",
+    show_dual_axis: bool = False,
+) -> go.Figure:
+    """
+    Creates aligned panel chart comparing Management Optimism Index vs Post-Filing Volatility.
+    
+    By default uses vertically aligned panels sharing the x-axis (filing date) to avoid
+    misleading dual-axis correlations. Set show_dual_axis=True for legacy overlay view.
+    """
+    # Sort by filing date for consistent rendering
+    df = metrics_df.sort_values("filing_date").reset_index(drop=True)
+    
+    # Determine backend for title
+    backend_label = backend.replace("_", " ").title()
+    if "lexicon" in backend.lower() or "loughran" in backend.lower():
+        backend_display = "Lexicon Baseline"
+    elif "finbert" in backend.lower():
+        backend_display = "FinBERT"
+    else:
+        backend_display = backend_label
+    
+    if show_dual_axis:
+        # Legacy dual-axis view (not recommended)
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        def _color_for_val(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "#6B7280"  # Gray for missing
+            return "#10B981" if val >= 0 else "#EF4444"
+        
+        fig.add_trace(
+            go.Bar(
+                x=df["filing_date"],
+                y=df["optimism_index"],
+                name="Management Optimism Index (MOI)",
+                marker_color=[_color_for_val(val) for val in df["optimism_index"]],
+                opacity=0.85,
+                customdata=df["accession"] if "accession" in df.columns else None,
+            ),
+            secondary_y=False,
+        )
+        
+        fig.add_trace(
+            go.Scatter(
+                x=df["filing_date"],
+                y=df["post_7d_volatility_pct"],
+                name="7-Day Post-Filing Annualized Volatility (%)",
+                mode="lines+markers",
+                line=dict(color="#60A5FA", width=3),
+                marker=dict(size=9),
+                customdata=df["accession"] if "accession" in df.columns else None,
+            ),
+            secondary_y=True,
+        )
+        
+        fig.update_layout(
+            title=(
+                f"Executive Sentiment ({backend_display} MOI) vs. Post-Filing Realized Volatility "
+                "<br><sup>Descriptive comparison; not evidence of predictive performance</sup>"
+            ),
+            template="plotly_white",  # Support light/dark via template
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=40, r=40, t=80, b=40),
+            height=420,
+        )
+        fig.update_yaxes(title_text="Management Optimism Index (-1 to +1)", secondary_y=False)
+        fig.update_yaxes(title_text="Annualized Volatility (%)", secondary_y=True)
+        return fig
+    
+    # Recommended: Two vertically aligned panels sharing x-axis
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=(
+            f"Filing Tone (MOI) — {backend_display}",
+            "Annualized Realized Volatility (7-Day Post-Filing Window)",
+        ),
+        row_heights=[0.5, 0.5],
+    )
+    
+    # Panel 1: MOI bars
     def _color_for_val(val):
         if val is None or (isinstance(val, float) and pd.isna(val)):
-            return "#6B7280"  # Gray for missing
+            return "#9CA3AF"  # Gray for missing
         return "#10B981" if val >= 0 else "#EF4444"
-
+    
+    moi_colors = [_color_for_val(val) for val in df["optimism_index"]]
+    
+    # Add pattern/shape for missing values (accessibility)
     fig.add_trace(
         go.Bar(
-            x=metrics_df["filing_date"],
-            y=metrics_df["optimism_index"],
+            x=df["filing_date"],
+            y=df["optimism_index"],
             name="Management Optimism Index (MOI)",
-            marker_color=[_color_for_val(val) for val in metrics_df["optimism_index"]],
+            marker_color=moi_colors,
             opacity=0.85,
+            customdata=df["accession"] if "accession" in df.columns else None,
+            hovertemplate=(
+                "Filing Date: %{x}<br>"
+                "MOI: %{y:.3f}<br>"
+                "Accession: %{customdata}<br>"
+                "<extra></extra>"
+            ),
         ),
-        secondary_y=False,
+        row=1, col=1,
     )
-
+    
+    # Zero reference line for MOI
+    fig.add_hline(y=0, line_dash="dot", line_color="#9CA3AF", line_width=1, row=1, col=1)
+    
+    # Panel 2: Volatility line
     fig.add_trace(
         go.Scatter(
-            x=metrics_df["filing_date"],
-            y=metrics_df["post_7d_volatility_pct"],
-            name="7-Day Post-Filing Annualized Volatility (%)",
+            x=df["filing_date"],
+            y=df["post_7d_volatility_pct"],
+            name="Annualized Volatility (%)",
             mode="lines+markers",
-            line=dict(color="#60A5FA", width=3),
-            marker=dict(size=9),
+            line=dict(color="#2563EB", width=2),
+            marker=dict(size=8, symbol="circle"),
+            connectgaps=False,  # Don't connect across missing values
+            customdata=df["accession"] if "accession" in df.columns else None,
+            hovertemplate=(
+                "Filing Date: %{x}<br>"
+                "Annualized Volatility: %{y:.2f}%<br>"
+                "Accession: %{customdata}<br>"
+                "<extra></extra>"
+            ),
         ),
-        secondary_y=True,
+        row=2, col=1,
     )
-
+    
+    # Coverage info
+    moi_available = df["optimism_index"].notna().sum()
+    vol_available = df["post_7d_volatility_pct"].notna().sum()
+    total = len(df)
+    
     fig.update_layout(
-        title="Executive Sentiment (FinBERT MOI) vs. Post-Filing Realized Stock Volatility",
-        template="plotly_dark",
+        title=(
+            f"Filing Tone & Volatility History — {backend_display} "
+            f"<br><sup>Tone available: {moi_available}/{total} | Volatility: {vol_available}/{total} | "
+            "Descriptive comparison; not evidence of predictive performance</sup>"
+        ),
+        template="plotly_white",  # Support both light/dark themes
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=40, r=40, t=60, b=40),
-        height=420,
+        margin=dict(l=40, r=40, t=100, b=40),
+        height=500,
+        showlegend=False,
     )
-    fig.update_yaxes(title_text="Management Optimism Index (-1 to +1)", secondary_y=False)
-    fig.update_yaxes(title_text="Annualized Volatility (%)", secondary_y=True)
+    fig.update_yaxes(title_text="MOI (-1 to +1)", row=1, col=1, zeroline=True, zerolinecolor="#9CA3AF")
+    fig.update_yaxes(title_text="Annualized Volatility (%)", row=2, col=1)
+    fig.update_xaxes(title_text="Filing Date", row=2, col=1)
+    
     return fig
 
 
-def create_sentiment_distribution_chart(sentiment_summary: dict[str, Any]) -> go.Figure:
-    """Creates a horizontal stacked bar chart of FinBERT sentence classifications."""
-    labels = ["Positive", "Neutral", "Negative"]
-    values = [
-        sentiment_summary.get("positive_ratio", 0.0) * 100,
-        sentiment_summary.get("neutral_ratio", 0.0) * 100,
-        sentiment_summary.get("negative_ratio", 0.0) * 100,
-    ]
-    colors = ["#10B981", "#6B7280", "#EF4444"]
-
-    fig = go.Figure(
-        go.Bar(
-            x=values,
-            y=labels,
-            orientation="h",
-            marker_color=colors,
-            text=[f"{v:.1f}%" for v in values],
-            textposition="auto",
+def create_sentiment_distribution_chart(
+    sentiment_summary: dict[str, Any],
+    backend: str = "unknown",
+    section_breakdown: Optional[dict[str, dict[str, float]]] = None,
+) -> go.Figure:
+    """
+    Creates a horizontal bar chart of sentence tone distribution.
+    
+    Shows actual backend used, sentence counts, and optional section-level breakdown.
+    Handles unavailable/zero-sentence states clearly.
+    """
+    backend_display = _get_backend_display_name(backend)
+    analyzed = sentiment_summary.get("analyzed_sentences", 0)
+    eligible = sentiment_summary.get("eligible_sentences", analyzed)
+    
+    # Check if sentiment is unavailable (no analyzed sentences)
+    if analyzed == 0:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No sentences analyzed — sentiment unavailable",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="#9CA3AF"),
         )
-    )
-    fig.update_layout(
-        title="FinBERT Sentence-Level Tone Breakdown (%)",
-        template="plotly_dark",
-        xaxis=dict(title="Percentage of Filing Sentences (%)", range=[0, 100]),
-        margin=dict(l=40, r=40, t=50, b=30),
-        height=280,
-    )
+        fig.update_layout(
+            title=f"Sentence Tone — {backend_display} (Unavailable)",
+            template="plotly_white",
+            margin=dict(l=40, r=40, t=50, b=30),
+            height=280,
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+        )
+        return fig
+    
+    # Determine display mode
+    has_sections = section_breakdown and len(section_breakdown) > 0
+    
+    if has_sections:
+        # Section-level 100% stacked bars
+        sections = list(section_breakdown.keys())
+        fig = go.Figure()
+        
+        for sentiment_label, color in [
+            ("Positive", "#10B981"),
+            ("Neutral", "#6B7280"),
+            ("Negative", "#EF4444"),
+        ]:
+            values = [section_breakdown[sec].get(sentiment_label.lower(), 0) * 100 for sec in sections]
+            fig.add_trace(
+                go.Bar(
+                    x=values,
+                    y=sections,
+                    orientation="h",
+                    name=sentiment_label,
+                    marker_color=color,
+                    text=[f"{v:.1f}%" if v > 0 else "" for v in values],
+                    textposition="inside",
+                    insidetextanchor="middle",
+                )
+            )
+        
+        fig.update_layout(
+            barmode="stack",
+            title=f"Sentence Tone by Section — {backend_display}",
+            template="plotly_white",
+            xaxis=dict(title="Percentage of Section Sentences (%)", range=[0, 100]),
+            margin=dict(l=120, r=40, t=50, b=30),
+            height=max(280, 80 * len(sections) + 80),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+    else:
+        # Aggregate horizontal bars with sentence counts
+        labels = ["Positive", "Neutral", "Negative"]
+        ratios = [
+            sentiment_summary.get("positive_ratio", 0.0),
+            sentiment_summary.get("neutral_ratio", 0.0),
+            sentiment_summary.get("negative_ratio", 0.0),
+        ]
+        values = [r * 100 for r in ratios]
+        counts = [round(r * analyzed) for r in ratios]
+        colors = ["#10B981", "#6B7280", "#EF4444"]
+        
+        fig = go.Figure(
+            go.Bar(
+                x=values,
+                y=labels,
+                orientation="h",
+                marker_color=colors,
+                text=[f"{v:.1f}% ({c} sentences)" for v, c in zip(values, counts)],
+                textposition="auto",
+                hovertemplate=(
+                    "Tone: %{y}<br>"
+                    "Percentage: %{x:.1f}%<br>"
+                    "Sentences: %{customdata}<br>"
+                    "<extra></extra>"
+                ),
+                customdata=counts,
+            )
+        )
+        
+        fig.update_layout(
+            title=f"Sentence Tone — {backend_display}",
+            template="plotly_white",
+            xaxis=dict(title="Percentage of Analyzed Sentences (%)", range=[0, 100]),
+            margin=dict(l=40, r=40, t=50, b=30),
+            height=280,
+        )
+    
+    # Add annotation for coverage
+    if analyzed < eligible:
+        fig.add_annotation(
+            text=f"Analyzed: {analyzed} of {eligible} eligible sentences",
+            xref="paper", yref="paper",
+            x=1, y=-0.15, showarrow=False,
+            font=dict(size=10, color="#9CA3AF"),
+            xanchor="right", yanchor="top",
+        )
+    
     return fig
 
 
-def create_execution_manifest_chart(manifest: dict[str, Any]) -> go.Figure:
-    """Creates a status chart for the execution manifest."""
-    components = [
-        ("Embedding", manifest.get("embedding_status", "unknown")),
-        ("Reranker", manifest.get("reranker_status", "unknown")),
-        ("Generator", manifest.get("generator_status", "unknown")),
-        ("Sentiment", manifest.get("sentiment_status", "unknown")),
-        ("Market Data", manifest.get("market_data_status", "unknown")),
-    ]
+def _get_backend_display_name(backend: str) -> str:
+    """Convert backend identifier to display name."""
+    backend_lower = backend.lower()
+    if "finbert" in backend_lower:
+        return "FinBERT"
+    elif "lexicon" in backend_lower or "loughran" in backend_lower:
+        return "Lexicon Baseline"
+    elif "offline" in backend_lower or "fallback" in backend_lower:
+        return "Offline Fallback"
+    else:
+        return backend.replace("_", " ").title()
 
-    status_colors = {
-        "success": "#10B981",
-        "degraded": "#F59E0B",
-        "failed": "#EF4444",
-        "skipped": "#6B7280",
-        "offline_fallback": "#8B5CF6",
+
+def create_execution_manifest_table(manifest: dict[str, Any]) -> pd.DataFrame:
+    """
+    Creates a DataFrame for rendering execution manifest as a status table.
+    
+    Returns a DataFrame with columns: Component, Actual Backend, State, Explanation.
+    """
+    # Map status to display
+    status_map = {
+        "success": ("✅ Complete", "Component executed successfully"),
+        "degraded": ("⚠️ Degraded", "Component completed with reduced capability"),
+        "failed": ("❌ Failed", "Component failed to execute"),
+        "skipped": ("⏭️ Skipped", "Component not required for this execution"),
+        "offline_fallback": ("🔄 Offline Fallback", "Using deterministic local fallback"),
     }
-
-    fig = go.Figure(
-        go.Bar(
-            x=[c[0] for c in components],
-            y=[1] * len(components),
-            marker_color=[status_colors.get(c[1], "#6B7280") for c in components],
-            text=[c[1] for c in components],
-            textposition="inside",
-            orientation="v",
-        )
-    )
-    fig.update_layout(
-        title="Pipeline Component Status",
-        template="plotly_dark",
-        yaxis=dict(showticklabels=False, showgrid=False),
-        margin=dict(l=40, r=40, t=50, b=30),
-        height=250,
-    )
-    return fig
+    
+    # Extract actual backends from manifest
+    backends = {
+        "Embedding": manifest.get("embedding_model", "unknown"),
+        "Reranker": manifest.get("reranker_model", "unknown"),
+        "Generator": manifest.get("generator_model", "unknown"),
+        "Sentiment": manifest.get("sentiment_model", "unknown"),
+        "Market Data": manifest.get("market_data_source", "Yahoo Finance"),
+    }
+    
+    statuses = {
+        "Embedding": manifest.get("embedding_status", "unknown"),
+        "Reranker": manifest.get("reranker_status", "unknown"),
+        "Generator": manifest.get("generator_status", "unknown"),
+        "Sentiment": manifest.get("sentiment_status", "unknown"),
+        "Market Data": manifest.get("market_data_status", "unknown"),
+    }
+    
+    rows = []
+    for component in ["Embedding", "Reranker", "Generator", "Sentiment", "Market Data"]:
+        status = statuses.get(component, "unknown")
+        state_label, explanation = status_map.get(status, ("❓ Unknown", "Status not recognized"))
+        backend = backends.get(component, "unknown")
+        
+        # Enhance explanation for fallback states
+        if status == "offline_fallback":
+            if component == "Embedding":
+                explanation = "Using SHA256 deterministic hash embeddings (no semantic search)"
+            elif component == "Reranker":
+                explanation = "No cross-encoder reranking; using vector similarity only"
+            elif component == "Generator":
+                explanation = "Using extractive synthesis (no LLM generation)"
+            elif component == "Sentiment":
+                explanation = "Using Loughran-McDonald lexicon (no neural model)"
+        
+        rows.append({
+            "Component": component,
+            "Actual Backend": backend,
+            "State": state_label,
+            "Explanation": explanation,
+        })
+    
+    return pd.DataFrame(rows)

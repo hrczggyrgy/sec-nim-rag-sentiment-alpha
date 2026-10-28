@@ -178,6 +178,7 @@ class FinancialFeaturePipeline:
                 negative_ratio=0.0,
                 neutral_ratio=0.0,
                 analyzed_sentences=0,
+                eligible_sentences=0,
                 section_coverage={"MD&A": 0, "Risk Factors": 0},
                 backend=self._model_version,
                 model_version=self._model_version,
@@ -327,6 +328,8 @@ class FinancialFeaturePipeline:
 
         # Aggregate metrics using probability-weighted approach
         total = len(scored_items)
+        # Track eligible sentences (original count before sampling)
+        eligible_total = original_total if 'original_total' in locals() else len(section_sentences)
         if total == 0:
             # Should not happen if we had section_sentences, but guard anyway
             warnings.append("No sentences scored after fallback")
@@ -336,6 +339,7 @@ class FinancialFeaturePipeline:
                 negative_ratio=0.0,
                 neutral_ratio=0.0,
                 analyzed_sentences=0,
+                eligible_sentences=eligible_total,
                 section_coverage={},
                 backend=self._model_version,
                 model_version=self._model_version,
@@ -357,10 +361,22 @@ class FinancialFeaturePipeline:
         neg_count = sum(1 for item in scored_items if item.label == "negative")
         neu_count = sum(1 for item in scored_items if item.label == "neutral")
 
-        # Section coverage
+        # Section coverage and section-level sentiment breakdown
         section_coverage = {}
+        section_sentiment = {}
         for section in set(sections):
-            section_coverage[section] = sum(1 for item in scored_items if item.section == section)
+            section_items = [item for item in scored_items if item.section == section]
+            section_coverage[section] = len(section_items)
+            if section_items:
+                sec_total = len(section_items)
+                sec_pos = sum(1 for item in section_items if item.label == "positive") / sec_total
+                sec_neg = sum(1 for item in section_items if item.label == "negative") / sec_total
+                sec_neu = sum(1 for item in section_items if item.label == "neutral") / sec_total
+                section_sentiment[section] = {
+                    "positive": round(sec_pos, 4),
+                    "negative": round(sec_neg, 4),
+                    "neutral": round(sec_neu, 4),
+                }
 
         # Top bullish/bearish by confidence (only if class exists)
         bullish_candidates = [item for item in scored_items if item.label == "positive"]
@@ -381,7 +397,9 @@ class FinancialFeaturePipeline:
             negative_ratio=round(neg_count / total, 4),
             neutral_ratio=round(neu_count / total, 4),
             analyzed_sentences=total,
+            eligible_sentences=eligible_total,
             section_coverage=section_coverage,
+            section_sentiment=section_sentiment,
             backend=self._model_version.split("/")[-1] if "/" in self._model_version else self._model_version,
             model_version=self._model_version,
             top_bullish_sentence=top_bullish,

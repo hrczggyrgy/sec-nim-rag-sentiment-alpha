@@ -348,6 +348,7 @@ class NVIDIANimRAGEngine:
                 "filing_date": d.metadata.get("filing_date", "N/A"),
                 "accession": d.metadata.get("accession_number", "N/A"),
                 "snippet": d.page_content[:280] + ("..." if len(d.page_content) > 280 else ""),
+                "full_text": d.page_content,
             }
             for d in top_docs
         ]
