@@ -26,8 +26,8 @@ class ModelConfig:
             "SEC_USER_AGENT", "QuantResearchBot contact@hrczggyrgy-portfolio.io"
         )
     )
-    nim_llm_model: str = "meta/llama-3.3-70b-instruct"
-    nim_embed_model: str = "nvidia/nv-embedqa-mistral-7b-v1"
+    nim_llm_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    nim_embed_model: str = "nvidia/nemotron-3.5-embed-8b"
     nim_rerank_model: str = "nvidia/llama-3.2-nv-rerankqa-1b-v2"
     finbert_model: str = "ProsusAI/finbert"
     local_embed_fallback: str = "sentence-transformers/all-MiniLM-L6-v2"
