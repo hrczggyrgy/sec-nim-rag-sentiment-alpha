@@ -121,7 +121,7 @@ def compute_claim_level_support(answer: str, context_chunks: list[str]) -> dict[
 
 def create_sentiment_volatility_figure(metrics_df: pd.DataFrame) -> go.Figure:
     """Creates a dual-axis Plotly chart comparing Management Optimism Index vs Post-Filing Volatility."""
-    fig = make_subplots(specs=[[{"secondary_axis": True}]])
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
     fig.add_trace(
         go.Bar(
@@ -134,7 +134,7 @@ def create_sentiment_volatility_figure(metrics_df: pd.DataFrame) -> go.Figure:
             ],
             opacity=0.85,
         ),
-        secondary_axis=False,
+        secondary_y=False,
     )
 
     fig.add_trace(
@@ -146,7 +146,7 @@ def create_sentiment_volatility_figure(metrics_df: pd.DataFrame) -> go.Figure:
             line=dict(color="#60A5FA", width=3),
             marker=dict(size=9),
         ),
-        secondary_axis=True,
+        secondary_y=True,
     )
 
     fig.update_layout(
@@ -157,8 +157,8 @@ def create_sentiment_volatility_figure(metrics_df: pd.DataFrame) -> go.Figure:
         margin=dict(l=40, r=40, t=60, b=40),
         height=420,
     )
-    fig.update_yaxes(title_text="Management Optimism Index (-1 to +1)", secondary_axis=False)
-    fig.update_yaxes(title_text="Annualized Volatility (%)", secondary_axis=True)
+    fig.update_yaxes(title_text="Management Optimism Index (-1 to +1)", secondary_y=False)
+    fig.update_yaxes(title_text="Annualized Volatility (%)", secondary_y=True)
     return fig
 
 
