@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from sec_nim_alpha.config import CACHE_DIR, RAW_FILINGS_DIR, CONFIG
+from sec_nim_alpha.config import CACHE_DIR, RAW_FILINGS_DIR, CONFIG, ensure_data_dirs
 from sec_nim_alpha.schemas import (
     FilingIdentifier,
     MarketMetrics,
@@ -177,7 +177,9 @@ class FilingRecord:
 
     @classmethod
     def from_dict(cls, data: dict) -> "FilingRecord":
-        """Deserialize from cached dict."""
+        """Deserialize from cached dict without mutating input."""
+        import copy
+        data = copy.deepcopy(data)
         # Handle nested objects
         if "risk_factors_extraction" in data and data["risk_factors_extraction"]:
             ext = data["risk_factors_extraction"]
@@ -225,6 +227,7 @@ class SECDataLoader:
     def __init__(self, user_agent: Optional[str] = None, execution_mode: Optional[ExecutionMode] = None) -> None:
         self.user_agent = user_agent or CONFIG.sec_user_agent
         self.execution_mode = execution_mode or CONFIG.execution_mode
+        ensure_data_dirs()
 
     def fetch_market_metrics(self, ticker: str, filing_date: str) -> MarketMetrics:
         """
@@ -241,20 +244,39 @@ class SECDataLoader:
             if hist.empty:
                 raise ValueError("No market price bars returned from Yahoo Finance.")
 
+            # Validate price data
+            closes = hist["Close"]
+            if closes.isna().any():
+                raise ValueError("Price data contains NaN values")
+            if np.isinf(closes).any():
+                raise ValueError("Price data contains infinite values")
+            if (closes <= 0).any():
+                raise ValueError("Price data contains non-positive values")
+            # Check for duplicates in index
+            if closes.index.duplicated().any():
+                raise ValueError("Price data contains duplicate timestamps")
+            # Check for unsorted index
+            if not closes.index.is_monotonic_increasing:
+                raise ValueError("Price data timestamps are not sorted")
+
             # Use first 8 trading days to get 7 daily returns
-            closes = hist["Close"].iloc[:8]
+            closes = closes.iloc[:8]
             daily_returns = closes.pct_change().dropna()
             trading_days_observed = len(daily_returns)
 
-            if trading_days_observed < 4:
-                raise ValueError(f"Insufficient trading days: {trading_days_observed} (need 7)")
+            # In research/production mode, require complete 7-day horizon
+            if self.execution_mode in (ExecutionMode.RESEARCH, ExecutionMode.PRODUCTION):
+                if trading_days_observed < 7:
+                    raise ValueError(f"Incomplete horizon: {trading_days_observed} trading days observed (need 7)")
 
             cum_return_pct = float(((closes.iloc[-1] / closes.iloc[0]) - 1.0) * 100.0)
             ann_volatility_pct = float(daily_returns.std() * np.sqrt(252) * 100.0)
 
             status = ComponentStatus.SUCCESS
             error_message = None
-            if trading_days_observed < 7:
+            
+            # In demo mode, allow degraded for partial horizon
+            if self.execution_mode == ExecutionMode.DEMO and trading_days_observed < 7:
                 status = ComponentStatus.DEGRADED
                 error_message = f"Only {trading_days_observed} trading days observed; horizon incomplete"
 
@@ -303,22 +325,26 @@ class SECDataLoader:
 
     def _extract_section(self, text: str, item_marker: str, section_title: str) -> SectionExtraction:
         """Extract a specific section with boundary detection."""
-        # Try to find section boundaries
+        # Try to find section boundaries - handle both normal and uppercase SEC headings
+        # Item 1A -> ITEM 1A (not ITEM A)
+        item_num = item_marker.replace("Item ", "").replace("item ", "")
         start_markers = [
             f"{item_marker}. {section_title}",
             f"{item_marker} {section_title}",
-            f"ITEM {item_marker[-1]}. {section_title.upper()}",
+            f"ITEM {item_num}. {section_title.upper()}",
+            f"ITEM {item_num} {section_title.upper()}",
         ]
+        # Include both normal and uppercase end markers
         end_markers = [
-            "Item 1B",
-            "Item 2.",
-            "Item 3.",
-            "Item 4.",
-            "Item 5.",
-            "Item 6.",
-            "Item 7.",
-            "Item 7A.",
-            "Item 8.",
+            "Item 1B", "ITEM 1B",
+            "Item 2.", "ITEM 2.",
+            "Item 3.", "ITEM 3.",
+            "Item 4.", "ITEM 4.",
+            "Item 5.", "ITEM 5.",
+            "Item 6.", "ITEM 6.",
+            "Item 7.", "ITEM 7.",
+            "Item 7A.", "ITEM 7A.",
+            "Item 8.", "ITEM 8.",
         ]
 
         content = ""
@@ -346,18 +372,26 @@ class SECDataLoader:
                 break
 
         if status == ComponentStatus.FAILED:
-            # Fallback: proportional split with warning
-            warnings.append(f"Section boundary detection failed for {item_marker}; using proportional fallback")
-            mid = len(text) // 2
-            if item_marker == "Item 1A":
-                content = text[:mid].strip()
-                char_start = 0
-                char_end = mid
+            if self.execution_mode in (ExecutionMode.RESEARCH, ExecutionMode.PRODUCTION):
+                # In research/production, missing sections are failures - no proportional fallback
+                warnings.append(f"Section boundary detection failed for {item_marker}; no fallback in {self.execution_mode.value} mode")
+                content = ""
+                char_start = -1
+                char_end = -1
+                status = ComponentStatus.FAILED
             else:
-                content = text[mid:].strip()
-                char_start = mid
-                char_end = len(text)
-            status = ComponentStatus.DEGRADED
+                # Demo mode: proportional split with warning
+                warnings.append(f"Section boundary detection failed for {item_marker}; using proportional fallback")
+                mid = len(text) // 2
+                if item_marker == "Item 1A":
+                    content = text[:mid].strip()
+                    char_start = 0
+                    char_end = mid
+                else:
+                    content = text[mid:].strip()
+                    char_start = mid
+                    char_end = len(text)
+                status = ComponentStatus.DEGRADED
 
         return SectionExtraction(
             section_name=f"{item_marker}: {section_title}",
@@ -391,8 +425,8 @@ class SECDataLoader:
         risk_text = str(getattr(tenk_obj, "risk_factors", "") or "")
         mda_text = str(getattr(tenk_obj, "mda", "") or "")
 
-        # If sections are too short, try full text extraction
-        if len(risk_text) < 200 and len(mda_text) < 200:
+        # If either section is too short, try full text extraction for both
+        if len(risk_text) < 200 or len(mda_text) < 200:
             full_text = latest.text()[:100000]  # Cap at 100k chars
             risk_ext, mda_ext = self._extract_sections(full_text)
             risk_text = risk_ext.content
@@ -415,11 +449,15 @@ class SECDataLoader:
                 parser_version="1.0.0",
             )
 
-        # Compute content hash for integrity
+        # Compute content hash for integrity (from full untruncated content)
         combined_content = f"{risk_text}\n{mda_text}"
         content_hash = compute_content_hash(combined_content)
 
         market_metrics = self.fetch_market_metrics(ticker, filing_date)
+
+        # Store truncated text in record (for memory), but keep full text for raw file
+        risk_text_stored = risk_text[:50000]
+        mda_text_stored = mda_text[:50000]
 
         record = FilingRecord(
             ticker=ticker,
@@ -432,14 +470,20 @@ class SECDataLoader:
             public_disseminated_at=accepted_at,
             source_url=f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}",
             content_hash=content_hash,
-            risk_factors_text=risk_text[:50000],  # Cap at 50k
-            mda_text=mda_text[:50000],
+            risk_factors_text=risk_text_stored,
+            mda_text=mda_text_stored,
             risk_factors_extraction=risk_ext,
             mda_extraction=mda_ext,
             market_metrics=market_metrics,
             is_synthetic_fallback=False,
             execution_mode=self.execution_mode,
         )
+        
+        # Save raw filing with full untruncated content for integrity verification
+        raw_file = RAW_FILINGS_DIR / f"{record.ticker}_{record.accession_number}_raw.txt"
+        raw_content = f"{risk_text}\n\n{mda_text}"
+        raw_file.write_text(raw_content, encoding="utf-8")
+        
         return record
 
     def fetch_latest_10k(self, ticker: str, force_refresh: bool = False) -> FilingRecord:
@@ -454,23 +498,40 @@ class SECDataLoader:
             # Check for cached live filing by accession
             cached_files = list(CACHE_DIR.glob(f"{ticker}_*_10k.json"))
             if cached_files:
-                # Load most recent cached filing
-                latest_cache = max(cached_files, key=lambda f: f.stat().st_mtime)
-                logger.info("Loading cached 10-K filing for %s from %s", ticker, latest_cache)
-                data = json.loads(latest_cache.read_text(encoding="utf-8"))
-                return FilingRecord.from_dict(data)
+                # Load most recent cached filing by accession number (not mtime)
+                # Parse accession from filename: {ticker}_{accession}_10k.json
+                def extract_accession(f):
+                    name = f.name
+                    prefix = f"{ticker}_"
+                    suffix = "_10k.json"
+                    if name.startswith(prefix) and name.endswith(suffix):
+                        return name[len(prefix):-len(suffix)]
+                    return ""
+                
+                # Sort by accession (which contains date info) descending
+                latest_cache = max(cached_files, key=lambda f: extract_accession(f))
+                
+                # Try to load cache with corrupt cache recovery
+                try:
+                    logger.info("Loading cached 10-K filing for %s from %s", ticker, latest_cache)
+                    data = json.loads(latest_cache.read_text(encoding="utf-8"))
+                    return FilingRecord.from_dict(data)
+                except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                    logger.warning("Corrupt cache file %s (%s); attempting live fetch", latest_cache, exc)
+                    # Fall through to live fetch
 
         try:
             record = self._fetch_live_10k(ticker)
+
+            # Reject synthetic records in research/production mode
+            if self.execution_mode in (ExecutionMode.RESEARCH, ExecutionMode.PRODUCTION) and record.is_synthetic_fallback:
+                raise ValueError("Research/production mode received synthetic fallback from live fetch")
 
             # Cache by accession (immutable)
             cache_file = CACHE_DIR / f"{record.ticker}_{record.accession_number}_10k.json"
             cache_file.write_text(json.dumps(record.to_dict(), indent=2), encoding="utf-8")
 
-            # Also save raw filing
-            raw_file = RAW_FILINGS_DIR / f"{record.ticker}_{record.accession_number}_raw.txt"
-            raw_content = f"{record.risk_factors_text}\n\n{record.mda_text}"
-            raw_file.write_text(raw_content, encoding="utf-8")
+            # Raw filing is already saved in _fetch_live_10k with full content
 
             logger.info("Successfully ingested live SEC 10-K for %s (%s, accession: %s)",
                        ticker, record.filing_date, record.accession_number)
@@ -484,11 +545,15 @@ class SECDataLoader:
                 raise RuntimeError(f"Live EDGAR fetch required but failed: {exc}") from exc
 
             # Demo mode: use curated corpus with explicit labeling
-            demo_key = ticker if ticker in DEMO_SEC_CORPUS else "NVDA"
-            fallback = DEMO_SEC_CORPUS[demo_key]
+            if ticker not in DEMO_SEC_CORPUS:
+                # Reject unsupported tickers in demo mode rather than silently substituting
+                raise ValueError(
+                    f"Ticker '{ticker}' not in demo corpus. "
+                    f"Supported demo tickers: {', '.join(sorted(DEMO_SEC_CORPUS.keys()))}. "
+                    f"Use a supported ticker or enable live EDGAR fetch."
+                )
 
-            if demo_key != ticker:
-                logger.warning("Ticker %s not in demo corpus; using %s data but labeling as %s", ticker, demo_key, ticker)
+            fallback = DEMO_SEC_CORPUS[ticker]
 
             filing_date = fallback["filing_date"]
             market_metrics = self.fetch_market_metrics(ticker, filing_date)
@@ -497,7 +562,7 @@ class SECDataLoader:
             content_hash = compute_content_hash(combined_content)
 
             record = FilingRecord(
-                ticker=ticker,  # Preserve requested ticker for demo
+                ticker=ticker,
                 cik=fallback["cik"],
                 form_type="10-K",
                 filing_date=filing_date,

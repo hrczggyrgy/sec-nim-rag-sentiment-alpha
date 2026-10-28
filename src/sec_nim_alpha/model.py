@@ -8,7 +8,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate
-from sec_nim_alpha.config import CONFIG, CHROMA_DIR
+from sec_nim_alpha.config import CONFIG, CHROMA_DIR, ensure_data_dirs
 from sec_nim_alpha.schemas import (
     ExecutionManifest,
     RAGResponse,
@@ -83,6 +83,14 @@ class NVIDIANimRAGEngine:
             self.api_key = CONFIG.nvidia_api_key
         self.api_key = self.api_key.strip() if self.api_key else ""
         self.nim_enabled = bool(self.api_key and self.api_key.startswith("nvapi-"))
+        
+        # Production mode requires valid NIM credentials
+        if self.execution_mode == ExecutionMode.PRODUCTION and not self.nim_enabled:
+            raise RuntimeError(
+                "Production mode requires a valid NVIDIA API key (nvapi-...). "
+                "Set NVIDIA_API_KEY environment variable or pass api_key parameter."
+            )
+        
         self._init_clients()
 
     def _init_clients(self) -> None:
@@ -135,10 +143,22 @@ class NVIDIANimRAGEngine:
         logger.info("Running in offline-safe RAG mode.")
 
     def _get_stable_collection_name(self, ticker: str, accession: str) -> str:
-        """Generate stable collection name from ticker and accession."""
-        core = f"{ticker}_{accession}_{CONFIG.nim_embed_model}"
+        """Generate stable collection name from ticker, accession, and actual embedding identity."""
+        # Include actual embedding backend/dimension to prevent mixed-embedding collections
+        embed_model = getattr(self.embeddings, 'model', 'unknown')
+        embed_dim = getattr(self.embeddings, 'dim', getattr(self.embeddings, 'dimension', 'unknown'))
+        core = f"{ticker}_{accession}_{embed_model}_{embed_dim}"
         hash_suffix = hashlib.sha256(core.encode()).hexdigest()[:12]
         return f"sec_{ticker.lower()}_{hash_suffix}"
+
+    def _get_actual_embedding_model(self) -> str:
+        """Return the actual embedding model/backend being used."""
+        embed_model = getattr(self.embeddings, 'model', None)
+        if embed_model:
+            return embed_model
+        # Fallback for StableHashEmbeddings
+        embed_dim = getattr(self.embeddings, 'dim', getattr(self.embeddings, 'dimension', 'unknown'))
+        return f"stable_hash_{embed_dim}d"
 
     def index_documents(
         self,
@@ -148,6 +168,8 @@ class NVIDIANimRAGEngine:
         accession: Optional[str] = None,
     ) -> int:
         """Embeds and indexes SEC filing chunks into a persistent Chroma vector store."""
+        ensure_data_dirs()
+        
         if not documents:
             raise ValueError("Cannot index an empty document list.")
 
@@ -163,11 +185,15 @@ class NVIDIANimRAGEngine:
 
         persist_dir = str(CHROMA_DIR) if CONFIG.chroma_persist else None
 
+        # Generate stable document IDs from chunk_id metadata for idempotent upserts
+        ids = [doc.metadata.get("chunk_id", f"doc_{idx}") for idx, doc in enumerate(documents)]
+
         self.vectorstore = Chroma.from_documents(
             documents=documents,
             embedding=self.embeddings,
             collection_name=collection_name,
             persist_directory=persist_dir,
+            ids=ids,
         )
 
         if CONFIG.chroma_persist and hasattr(self.vectorstore, "persist"):
@@ -192,6 +218,7 @@ class NVIDIANimRAGEngine:
         rerank_metadata = {
             "reranker_status": ComponentStatus.SKIPPED.value,
             "rerank_count": 0,
+            "retrieval_count": retrieval_count,
         }
 
         if self.nim_enabled and self.reranker is not None and len(candidates) > 1:
@@ -229,15 +256,13 @@ class NVIDIANimRAGEngine:
         query: str,
         sentiment_summary: Optional[dict[str, Any]] = None,
         filing_accession: Optional[str] = None,
+        sentiment_status: ComponentStatus = ComponentStatus.SKIPPED,
+        market_data_status: ComponentStatus = ComponentStatus.SKIPPED,
     ) -> RAGResponse:
         """Runs full Two-Stage RAG + synthesis and returns response with execution manifest."""
         top_docs, retrieval_ms, rerank_meta = self.retrieve_and_rerank(query)
 
-        context_blocks = [
-            f"[{d.metadata.get('section')} | {d.metadata.get('chunk_id')}]\n{d.page_content}"
-            for d in top_docs
-        ]
-        context_str = "\n\n".join(context_blocks)
+        # Prepare sentiment string for both paths
         sentiment_str = (
             f"Management Optimism Index (MOI): {sentiment_summary.get('optimism_index', 0.0):+.3f} "
             f"(Positive: {sentiment_summary.get('positive_ratio', 0.0)*100:.1f}%, "
@@ -246,38 +271,52 @@ class NVIDIANimRAGEngine:
             else "No quantitative sentiment summary provided."
         )
 
-        t_gen = time.perf_counter()
-        generator_status = ComponentStatus.SKIPPED
-
-        if self.nim_enabled and self.llm is not None:
-            try:
-                prompt = ChatPromptTemplate.from_messages(
-                    [("system", self.SYSTEM_PROMPT), ("human", "{question}")]
-                )
-                chain = prompt | self.llm
-                result = chain.invoke(
-                    {
-                        "sentiment_context": sentiment_str,
-                        "context": context_str,
-                        "question": query,
-                    }
-                )
-                answer_text = str(result.content)
-                generator_status = ComponentStatus.SUCCESS
-                self._generator_status = ComponentStatus.SUCCESS
-            except Exception as exc:
-                logger.warning("NIM LLM synthesis error (%s). Falling back to extractive synthesis.", exc)
-                answer_text = self._extractive_fallback(query, top_docs, sentiment_str)
-                generator_status = ComponentStatus.DEGRADED
-                self._generator_status = ComponentStatus.DEGRADED
+        # If no evidence retrieved, skip LLM/generator and return insufficient_evidence response
+        if len(top_docs) == 0:
+            gen_ms = 0.0
+            groundedness = 0.0
+            answer_text = self._extractive_fallback(query, [], sentiment_str)
+            generator_status = ComponentStatus.SKIPPED
+            self._generator_status = ComponentStatus.SKIPPED
         else:
-            answer_text = self._extractive_fallback(query, top_docs, sentiment_str)
-            generator_status = ComponentStatus.OFFLINE_FALLBACK
-            self._generator_status = ComponentStatus.OFFLINE_FALLBACK
+            context_blocks = [
+                f"[{d.metadata.get('section')} | {d.metadata.get('chunk_id')}]\n{d.page_content}"
+                for d in top_docs
+            ]
+            context_str = "\n\n".join(context_blocks)
 
-        gen_ms = round((time.perf_counter() - t_gen) * 1000.0, 2)
-        raw_texts = [d.page_content for d in top_docs]
-        groundedness = compute_lexical_groundedness(answer_text, raw_texts)
+            t_gen = time.perf_counter()
+            generator_status = ComponentStatus.SKIPPED
+
+            if self.nim_enabled and self.llm is not None:
+                try:
+                    prompt = ChatPromptTemplate.from_messages(
+                        [("system", self.SYSTEM_PROMPT), ("human", "{question}")]
+                    )
+                    chain = prompt | self.llm
+                    result = chain.invoke(
+                        {
+                            "sentiment_context": sentiment_str,
+                            "context": context_str,
+                            "question": query,
+                        }
+                    )
+                    answer_text = str(result.content)
+                    generator_status = ComponentStatus.SUCCESS
+                    self._generator_status = ComponentStatus.SUCCESS
+                except Exception as exc:
+                    logger.warning("NIM LLM synthesis error (%s). Falling back to extractive synthesis.", exc)
+                    answer_text = self._extractive_fallback(query, top_docs, sentiment_str)
+                    generator_status = ComponentStatus.DEGRADED
+                    self._generator_status = ComponentStatus.DEGRADED
+            else:
+                answer_text = self._extractive_fallback(query, top_docs, sentiment_str)
+                generator_status = ComponentStatus.OFFLINE_FALLBACK
+                self._generator_status = ComponentStatus.OFFLINE_FALLBACK
+
+            gen_ms = round((time.perf_counter() - t_gen) * 1000.0, 2)
+            raw_texts = [d.page_content for d in top_docs]
+            groundedness = compute_lexical_groundedness(answer_text, raw_texts)
 
         citations = [
             {
@@ -290,20 +329,20 @@ class NVIDIANimRAGEngine:
             for d in top_docs
         ]
 
-        # Build execution manifest
+        # Build execution manifest with actual component statuses
         manifest = ExecutionManifest(
             data_mode=self.execution_mode,
             filing_accession=filing_accession,
             index_version=CONFIG.nim_embed_model,
-            embedding_model=CONFIG.nim_embed_model,
+            embedding_model=self._get_actual_embedding_model(),
             embedding_status=self._embedding_status,
             reranker_model=CONFIG.nim_rerank_model,
             reranker_status=ComponentStatus(rerank_meta["reranker_status"]),
             generator_model=CONFIG.nim_llm_model,
             generator_status=generator_status,
             sentiment_backend=sentiment_summary.get("backend", "unknown") if sentiment_summary else "unknown",
-            sentiment_status=ComponentStatus.SUCCESS,
-            market_data_status=ComponentStatus.SUCCESS,
+            sentiment_status=sentiment_status,
+            market_data_status=market_data_status,
             warnings=tuple(),
         )
 
@@ -324,7 +363,7 @@ class NVIDIANimRAGEngine:
             groundedness_score=groundedness,
             engine_mode=actual_mode,
             execution_manifest=manifest,
-            retrieval_count=rerank_meta.get("rerank_count", 0) + len(top_docs),
+            retrieval_count=rerank_meta.get("retrieval_count", 0),
             rerank_count=rerank_meta.get("rerank_count", 0),
             insufficient_evidence=len(top_docs) == 0,
         )

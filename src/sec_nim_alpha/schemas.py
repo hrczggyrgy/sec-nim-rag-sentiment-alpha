@@ -162,7 +162,7 @@ class SentenceSentiment:
 class SentimentResult:
     """Aggregated sentiment with section coverage and backend provenance."""
 
-    optimism_index: float
+    optimism_index: Optional[float]
     positive_ratio: float
     negative_ratio: float
     neutral_ratio: float

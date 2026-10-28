@@ -1,5 +1,6 @@
 """Semantic document chunking and FinBERT quantitative sentiment feature engineering."""
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -89,10 +90,13 @@ class FinancialFeaturePipeline:
             ("Item 7: MD&A", record.mda_text),
         ]
         documents: list[Document] = []
+        # Use full accession hash for unique chunk IDs across filing years
+        accession_suffix = hashlib.sha256(record.accession_number.encode()).hexdigest()[:12]
         for section_name, raw_text in sections:
             if not raw_text.strip():
                 continue
             chunks = self.splitter.split_text(raw_text)
+            section_key = section_name[:7].replace(' ', '').replace(':', '')
             for idx, chunk in enumerate(chunks):
                 doc = Document(
                     page_content=chunk,
@@ -105,7 +109,7 @@ class FinancialFeaturePipeline:
                         "period_end": record.period_end,
                         "filed_at": record.filed_at,
                         "section": section_name,
-                        "chunk_id": f"{record.ticker}_{record.accession_number[:8]}_{section_name[:7].replace(' ', '')}_{idx}",
+                        "chunk_id": f"{record.ticker}_{accession_suffix}_{section_key}_{idx}",
                         "content_hash": record.content_hash,
                         "is_synthetic": record.is_synthetic_fallback,
                     },
@@ -160,17 +164,25 @@ class FinancialFeaturePipeline:
                 if len(sent.strip()) > 45:
                     section_sentences.append((sent.strip(), section_name))
 
+        # Store original counts for accurate warning
+        original_mda_count = sum(1 for _, sec in section_sentences if sec == "MD&A")
+        original_rf_count = sum(1 for _, sec in section_sentences if sec == "Risk Factors")
+        original_total = len(section_sentences)
+
         if not section_sentences:
             warnings = ["No eligible sentences found in filing"]
+            # Return null sentiment for no evidence (proposed contract)
             return SentimentResult(
-                optimism_index=0.0,
+                optimism_index=None,
                 positive_ratio=0.0,
                 negative_ratio=0.0,
-                neutral_ratio=1.0,
+                neutral_ratio=0.0,
                 analyzed_sentences=0,
                 section_coverage={"MD&A": 0, "Risk Factors": 0},
                 backend=self._model_version,
                 model_version=self._model_version,
+                top_bullish_sentence=None,
+                top_bearish_sentence=None,
                 warnings=tuple(warnings),
             )
 
@@ -178,15 +190,42 @@ class FinancialFeaturePipeline:
         max_sentences = CONFIG.max_sentiment_sentences
         if len(section_sentences) > max_sentences:
             # Stratified sampling: proportional from each section
+            # B15 FIX: Don't reserve minimum quota for empty sections
             mda_sents = [s for s, sec in section_sentences if sec == "MD&A"]
             rf_sents = [s for s, sec in section_sentences if sec == "Risk Factors"]
-            mda_quota = max(1, int(max_sentences * len(mda_sents) / len(section_sentences)))
-            rf_quota = max_sentences - mda_quota
+            
+            # Calculate proportional quotas without minimum floor
+            if original_total > 0:
+                mda_quota = int(round(max_sentences * len(mda_sents) / original_total))
+                rf_quota = int(round(max_sentences * len(rf_sents) / original_total))
+            else:
+                mda_quota = 0
+                rf_quota = 0
+            
+            # Adjust to match max_sentences exactly
+            while mda_quota + rf_quota > max_sentences:
+                if mda_quota > rf_quota:
+                    mda_quota -= 1
+                else:
+                    rf_quota -= 1
+            while mda_quota + rf_quota < max_sentences:
+                if len(mda_sents) > mda_quota:
+                    mda_quota += 1
+                elif len(rf_sents) > rf_quota:
+                    rf_quota += 1
+                else:
+                    break
+            
+            # Ensure quotas don't exceed available sentences
+            mda_quota = min(mda_quota, len(mda_sents))
+            rf_quota = min(rf_quota, len(rf_sents))
 
             sampled = mda_sents[:mda_quota] + rf_sents[:rf_quota]
             section_sentences = [(s, "MD&A") for s in sampled[:mda_quota]] + \
                                [(s, "Risk Factors") for s in sampled[mda_quota:]]
-            warnings = [f"Sampled {len(section_sentences)} of {len(section_sentences)} sentences proportionally"]
+            # B16 FIX: Use original counts in warning
+            warnings = [f"Sampled {len(section_sentences)} of {original_total} sentences proportionally "
+                       f"(MD&A: {mda_quota}/{original_mda_count}, Risk Factors: {rf_quota}/{original_rf_count})"]
         else:
             warnings = []
 
@@ -200,6 +239,20 @@ class FinancialFeaturePipeline:
             try:
                 # FinBERT returns all scores when return_all_scores=True
                 all_preds = clf(sentences)
+                
+                # B17/B18 FIX: Validate prediction batch before accepting any results
+                if len(all_preds) != len(sentences):
+                    raise ValueError(f"FinBERT returned {len(all_preds)} predictions for {len(sentences)} sentences")
+                
+                # Validate each prediction has valid probability distributions
+                for preds in all_preds:
+                    if not isinstance(preds, list) or len(preds) == 0:
+                        raise ValueError("FinBERT returned invalid prediction format")
+                    total_prob = sum(p.get("score", 0) for p in preds)
+                    if abs(total_prob - 1.0) > 0.01:  # Allow small floating point error
+                        raise ValueError(f"FinBERT probabilities don't sum to 1: {total_prob}")
+                
+                # All valid - now process
                 for sent, section, preds in zip(sentences, sections, all_preds):
                     probs = {str(p["label"]).lower(): p["score"] for p in preds}
                     pos_p = probs.get("positive", 0.0)
@@ -213,7 +266,7 @@ class FinancialFeaturePipeline:
                     scored_items.append(SentenceSentiment(
                         sentence=sent,
                         section=section,
-                        char_offset=0,  # Would need original offsets
+                        char_offset=0,
                         positive_prob=pos_p,
                         negative_prob=neg_p,
                         neutral_prob=neu_p,
@@ -223,10 +276,12 @@ class FinancialFeaturePipeline:
                         model_version=self._model_version,
                     ))
             except Exception as exc:
-                logger.warning("FinBERT inference failed (%s). Falling back to lexicon.", exc)
+                logger.warning("FinBERT inference failed (%s). Falling back to lexicon for all sentences.", exc)
                 clf = None
+                scored_items = []  # Clear any partial results
 
         if clf is None:
+            # Lexicon fallback for all sentences
             for sent, section in section_sentences:
                 probs, label, confidence = self._lexicon_score_sentence(sent)
                 scored_items.append(SentenceSentiment(
@@ -246,18 +301,27 @@ class FinancialFeaturePipeline:
         # Aggregate metrics using probability-weighted approach
         total = len(scored_items)
         if total == 0:
+            # Should not happen if we had section_sentences, but guard anyway
+            warnings.append("No sentences scored after fallback")
             return SentimentResult(
-                optimism_index=0.0,
+                optimism_index=None,
                 positive_ratio=0.0,
                 negative_ratio=0.0,
-                neutral_ratio=1.0,
+                neutral_ratio=0.0,
                 analyzed_sentences=0,
                 section_coverage={},
                 backend=self._model_version,
                 model_version=self._model_version,
+                top_bullish_sentence=None,
+                top_bearish_sentence=None,
+                warnings=tuple(warnings),
             )
 
-        # Probability-weighted optimism index (proposed formula from review)
+        # Verify we have exactly one score per input sentence (transactional)
+        if total != len(sentences):
+            raise RuntimeError(f"Sentiment scoring produced {total} results for {len(sentences)} input sentences")
+
+        # Probability-weighted optimism index
         weighted_sum = sum(item.positive_prob - item.negative_prob for item in scored_items)
         optimism_index = round(weighted_sum / total, 4)
 

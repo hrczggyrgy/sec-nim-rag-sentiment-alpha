@@ -12,6 +12,7 @@ from sec_nim_alpha.utils import (
     set_request_id,
     compute_claim_level_support,
 )
+from sec_nim_alpha.schemas import ComponentStatus
 
 st.set_page_config(
     page_title="SEC Filing NIM RAG & FinBERT Alpha Terminal",
@@ -57,7 +58,6 @@ with st.sidebar:
     run_btn = st.button("🚀 Run SEC Ingestion & Indexing", type="primary", use_container_width=True)
 
 
-@st.cache_resource(show_spinner="Executing SEC EDGAR Ingestion, FinBERT Scoring, and Vector Indexing...")
 def run_full_pipeline(
     ticker: str,
     api_key: str,
@@ -65,7 +65,7 @@ def run_full_pipeline(
     refresh: bool,
     execution_mode: ExecutionMode,
 ):
-    # Set request ID for tracing
+    # Set request ID for tracing (outside cache for uniqueness per call)
     request_id = set_request_id()
 
     loader = SECDataLoader(execution_mode=execution_mode)
@@ -77,10 +77,25 @@ def run_full_pipeline(
     sentiment = feat_pipe.compute_sentiment_features(record)
 
     # Update panel with current filing's actual data (not synthetic)
+    # Insert or update row by accession to avoid overwriting wrong filing
     if record.market_metrics:
-        panel_df.loc[panel_df.index[-1] if len(panel_df) > 0 else 0, "optimism_index"] = sentiment.optimism_index
-        panel_df.loc[panel_df.index[-1] if len(panel_df) > 0 else 0, "post_7d_volatility_pct"] = record.market_metrics.post_7d_volatility_pct
-        panel_df.loc[panel_df.index[-1] if len(panel_df) > 0 else 0, "post_7d_return_pct"] = record.market_metrics.post_7d_return_pct
+        # Check if this accession already exists in panel
+        mask = panel_df["accession"] == record.accession_number
+        new_row = {
+            "ticker": record.ticker,
+            "filing_date": record.filing_date,
+            "quarter": f"Q{(int(record.filing_date[5:7]) - 1) // 3 + 1}",
+            "optimism_index": sentiment.optimism_index,
+            "post_7d_volatility_pct": record.market_metrics.post_7d_volatility_pct,
+            "post_7d_return_pct": record.market_metrics.post_7d_return_pct,
+            "accession": record.accession_number,
+        }
+        if mask.any():
+            # Update existing row
+            panel_df.loc[mask, list(new_row.keys())] = list(new_row.values())
+        else:
+            # Insert new row
+            panel_df = pd.concat([panel_df, pd.DataFrame([new_row])], ignore_index=True)
 
     rag_engine = NVIDIANimRAGEngine(api_key=api_key, execution_mode=execution_mode)
     rag_engine.index_documents(
@@ -91,10 +106,28 @@ def run_full_pipeline(
     return record, sentiment, panel_df, rag_engine, request_id
 
 
+@st.cache_resource(show_spinner="Executing SEC EDGAR Ingestion, FinBERT Scoring, and Vector Indexing...")
+def run_full_pipeline_cached(
+    ticker: str,
+    api_key: str,
+    enable_finbert: bool,
+    execution_mode: ExecutionMode,
+):
+    """Cached version without refresh - for non-refresh runs only."""
+    return run_full_pipeline(ticker, api_key, enable_finbert, False, execution_mode)
+
+
 # Run pipeline
-record, sentiment, panel_df, rag_engine, request_id = run_full_pipeline(
-    active_ticker, api_key_input, use_live_finbert, force_edgar_refresh or run_btn, execution_mode
-)
+if force_edgar_refresh or run_btn:
+    # Bypass cache for refresh
+    record, sentiment, panel_df, rag_engine, request_id = run_full_pipeline(
+        active_ticker, api_key_input, use_live_finbert, True, execution_mode
+    )
+else:
+    # Use cached version
+    record, sentiment, panel_df, rag_engine, request_id = run_full_pipeline_cached(
+        active_ticker, api_key_input, use_live_finbert, execution_mode
+    )
 
 # --- Header Metrics ---
 col1, col2, col3, col4 = st.columns(4)
@@ -105,14 +138,14 @@ col1.metric(
 )
 col2.metric(
     "Management Optimism Index (MOI)",
-    f"{sentiment.optimism_index:+.3f}",
+    f"{sentiment.optimism_index:+.3f}" if sentiment.optimism_index is not None else "N/A",
     f"{sentiment.positive_ratio * 100:.1f}% Bullish | {sentiment.analyzed_sentences} sentences",
     help=f"Backend: {sentiment.backend} | Coverage: {sentiment.section_coverage}",
 )
 col3.metric(
     "7-Day Post-Filing Volatility",
-    f"{record.market_metrics.post_7d_volatility_pct:.2f}%" if record.market_metrics and record.market_metrics.post_7d_volatility_pct else "N/A",
-    f"{record.market_metrics.post_7d_return_pct:+.2f}% 7D Return" if record.market_metrics and record.market_metrics.post_7d_return_pct else "N/A",
+    f"{record.market_metrics.post_7d_volatility_pct:.2f}%" if record.market_metrics and record.market_metrics.post_7d_volatility_pct is not None else "N/A",
+    f"{record.market_metrics.post_7d_return_pct:+.2f}% 7D Return" if record.market_metrics and record.market_metrics.post_7d_return_pct is not None else "N/A",
     help=f"Status: {record.market_metrics.status.value if record.market_metrics else 'unknown'} | Days: {record.market_metrics.trading_days_observed if record.market_metrics else 0}/7",
 )
 engine_label = "NVIDIA NIM" if rag_engine.nim_enabled else "Offline Fallback"
@@ -123,8 +156,8 @@ if record.is_synthetic_fallback:
     st.warning("⚠️ **DEMO MODE**: This filing uses curated synthetic data. Not for research use.")
 
 # Market data status
-if record.market_metrics and record.market_metrics.status != "success":
-    status_color = "🟡" if record.market_metrics.status == "degraded" else "🔴"
+if record.market_metrics and record.market_metrics.status != ComponentStatus.SUCCESS:
+    status_color = "🟡" if record.market_metrics.status == ComponentStatus.DEGRADED else "🔴"
     st.warning(f"{status_color} Market Data: {record.market_metrics.status.value} - {record.market_metrics.error_message}")
 
 st.divider()
@@ -168,6 +201,8 @@ if st.button("🔍 Retrieve & Synthesize Cited Answer", type="primary"):
         user_query,
         sentiment_summary=sentiment.to_dict(),
         filing_accession=record.accession_number,
+        sentiment_status=ComponentStatus.SUCCESS if sentiment.analyzed_sentences > 0 else ComponentStatus.FAILED,
+        market_data_status=record.market_metrics.status if record.market_metrics else ComponentStatus.FAILED,
     )
 
     m1, m2, m3, m4 = st.columns(4)
@@ -179,7 +214,6 @@ if st.button("🔍 Retrieve & Synthesize Cited Answer", type="primary"):
     st.markdown(response.answer)
 
     # Claim-level support
-    from src.utils import compute_claim_level_support
     claim_support = compute_claim_level_support(response.answer, [c["snippet"] for c in response.citations])
     if claim_support["total_claims"] > 0:
         st.caption(

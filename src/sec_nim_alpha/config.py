@@ -15,8 +15,11 @@ CACHE_DIR = DATA_DIR / "cache"
 CHROMA_DIR = DATA_DIR / "chroma_db"
 RAW_FILINGS_DIR = DATA_DIR / "raw_filings"
 
-for directory in (DATA_DIR, CACHE_DIR, CHROMA_DIR, RAW_FILINGS_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+
+def ensure_data_dirs() -> None:
+    """Create data directories on demand (not at import time)."""
+    for directory in (DATA_DIR, CACHE_DIR, CHROMA_DIR, RAW_FILINGS_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)

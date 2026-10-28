@@ -23,11 +23,7 @@ class StructuredLogger:
         if not self.logger.handlers:
             self.logger.setLevel(logging.INFO)
             handler = logging.StreamHandler(sys.stdout)
-            formatter = logging.Formatter(
-                fmt='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s", "request_id": "%(request_id)s"}',
-                datefmt="%Y-%m-%dT%H:%M:%S",
-            )
-            handler.setFormatter(formatter)
+            handler.setFormatter(JsonFormatter())
             self.logger.addHandler(handler)
 
     def _log(self, level: int, message: str, *args: Any, **kwargs: Any) -> None:
@@ -50,6 +46,28 @@ class StructuredLogger:
 
     def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
         self._log(logging.DEBUG, message, *args, **kwargs)
+
+
+class JsonFormatter(logging.Formatter):
+    """JSON formatter that properly escapes all fields."""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        log_data = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(record, "request_id", ""),
+        }
+        # Add any extra fields
+        for key, value in record.__dict__.items():
+            if key not in ("name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+                          "module", "lineno", "created", "msecs", "relativeCreated", "thread",
+                          "threadName", "processName", "process", "message", "asctime",
+                          "exc_info", "exc_text", "stack_info", "request_id"):
+                log_data[key] = value
+        return json.dumps(log_data, ensure_ascii=False)
 
 
 def get_logger(name: str) -> StructuredLogger:
@@ -90,22 +108,30 @@ def compute_lexical_groundedness(answer: str, context_chunks: list[str]) -> floa
 def compute_claim_level_support(answer: str, context_chunks: list[str]) -> dict[str, Any]:
     """
     Attempts claim-level support checking by extracting numerical claims from answer
-    and verifying presence in context.
+    and verifying presence in context using precise boundary matching.
     """
     import re
 
-    # Extract numerical claims (percentages, dollar amounts, ratios)
-    numerical_claims = re.findall(
-        r"\b\d+(?:\.\d+)?\s*%|\$\d+(?:\.\d+)?[BMK]?|\b\d+(?:\.\d+)?x\b",
-        answer
+    # Extract numerical claims (percentages, dollar amounts, ratios) with surrounding context
+    # Pattern captures the full claim including potential sign and unit
+    claim_pattern = re.compile(
+        r"(?<!\d)(?:[+-]?\d+(?:\.\d+)?\s*%|\$[+-]?\d+(?:\.\d+)?[BMK]?|[+-]?\d+(?:\.\d+)?x)(?!\d)"
     )
+    
+    # Find claims with their positions for better context matching
+    numerical_claims = claim_pattern.findall(answer)
 
     combined_context = " ".join(context_chunks)
     supported_claims = []
     unsupported_claims = []
 
     for claim in numerical_claims:
-        if claim in combined_context:
+        # Use word-boundary-aware matching: claim must appear as a complete token
+        # Escape special regex characters in the claim
+        escaped_claim = re.escape(claim.strip())
+        # Match with word boundaries or string boundaries
+        pattern = rf"(?<![\d\w]){escaped_claim}(?![\d\w])"
+        if re.search(pattern, combined_context):
             supported_claims.append(claim)
         else:
             unsupported_claims.append(claim)
@@ -123,15 +149,18 @@ def create_sentiment_volatility_figure(metrics_df: pd.DataFrame) -> go.Figure:
     """Creates a dual-axis Plotly chart comparing Management Optimism Index vs Post-Filing Volatility."""
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
+    # Handle missing/NaN sentiment values gracefully
+    def _color_for_val(val):
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return "#6B7280"  # Gray for missing
+        return "#10B981" if val >= 0 else "#EF4444"
+
     fig.add_trace(
         go.Bar(
             x=metrics_df["filing_date"],
             y=metrics_df["optimism_index"],
             name="Management Optimism Index (MOI)",
-            marker_color=[
-                "#10B981" if val >= 0 else "#EF4444"
-                for val in metrics_df["optimism_index"]
-            ],
+            marker_color=[_color_for_val(val) for val in metrics_df["optimism_index"]],
             opacity=0.85,
         ),
         secondary_y=False,
