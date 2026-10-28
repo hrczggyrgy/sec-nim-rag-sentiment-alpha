@@ -1,16 +1,18 @@
 """Unit test suite for SEC ingestion, FinBERT feature engineering, and NVIDIA NIM RAG pipeline."""
 
 import pytest
-from src.data_loader import FilingRecord, SECDataLoader
-from src.features import FinancialFeaturePipeline
-from src.model import NVIDIANimRAGEngine
-from src.utils import compute_lexical_groundedness
+from sec_nim_alpha.data_loader import FilingRecord, SECDataLoader
+from sec_nim_alpha.features import FinancialFeaturePipeline
+from sec_nim_alpha.model import NVIDIANimRAGEngine
+from sec_nim_alpha.utils import compute_lexical_groundedness
+from sec_nim_alpha.schemas import ComponentStatus
 
 
 @pytest.fixture
 def sample_record() -> FilingRecord:
     loader = SECDataLoader()
-    return loader.fetch_latest_10k("NVDA")
+    # Force refresh to get new structure
+    return loader.fetch_latest_10k("NVDA", force_refresh=True)
 
 
 def test_sec_data_loader_returns_valid_record(sample_record: FilingRecord) -> None:
@@ -18,7 +20,9 @@ def test_sec_data_loader_returns_valid_record(sample_record: FilingRecord) -> No
     assert sample_record.form_type == "10-K"
     # Live EDGAR data may have empty MD&A; require at least one section to have content
     assert len(sample_record.risk_factors_text) > 100 or len(sample_record.mda_text) > 100
-    assert isinstance(sample_record.post_7d_volatility_pct, float)
+    assert sample_record.market_metrics is not None
+    assert isinstance(sample_record.market_metrics.post_7d_volatility_pct, float)
+    assert sample_record.market_metrics.status in (ComponentStatus.SUCCESS, ComponentStatus.DEGRADED, ComponentStatus.OFFLINE_FALLBACK)
 
 
 def test_feature_pipeline_chunks_and_scores_sentiment(sample_record: FilingRecord) -> None:

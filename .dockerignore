@@ -1,0 +1,65 @@
+# Git
+.git
+.gitignore
+
+# Virtual environments
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Cache and data
+data/cache
+data/chroma_db
+data/raw_filings
+*.cache
+.pytest_cache
+.coverage
+htmlcov
+.tox
+
+# Build artifacts
+dist
+build
+*.egg-info
+src/*.egg-info
+pip-wheel-metadata
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.coverage
+.pytest_cache
+htmlcov
+
+# Documentation
+*.md
+!README.md
+
+# Jupyter
+.ipynb_checkpoints
+
+# Lock files (we'll generate in builder)
+uv.lock
+poetry.lock
+Pipfile.lock
