@@ -607,6 +607,27 @@ class SECDataLoader:
 
             return record
 
+    def load_filing_by_accession(self, ticker: str, accession: str) -> Optional[FilingRecord]:
+        """
+        Load a specific cached filing by accession number.
+        Returns None if not found.
+        """
+        ticker = ticker.upper().strip()
+        cache_file = CACHE_DIR / f"{ticker}_{accession}_10k.json"
+        
+        if not cache_file.exists():
+            logger.info("Cached filing not found: %s", cache_file)
+            return None
+        
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            record = FilingRecord.from_dict(data)
+            logger.info("Loaded cached filing for %s accession %s", ticker, accession)
+            return record
+        except Exception as exc:
+            logger.warning("Failed to load cached filing %s: %s", cache_file, exc)
+            return None
+
     def load_historical_panel(self, ticker: str) -> pd.DataFrame:
         """
         Loads historical panel from actual cached filings.

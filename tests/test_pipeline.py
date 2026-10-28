@@ -318,3 +318,91 @@ def test_sentiment_fallback_warning_recorded() -> None:
     # Should use lexicon backend
     assert sentiment.backend == "loughran_mcdonald_lexicon_v1"
     # Note: no fallback warning in pure lexicon mode
+
+
+def test_load_filing_by_accession() -> None:
+    """Test loading a specific filing by accession from cache."""
+    from sec_nim_alpha.config import CACHE_DIR
+    
+    # Clean up
+    for f in CACHE_DIR.glob("TEST_*_10k.json"):
+        f.unlink(missing_ok=True)
+    
+    loader = SECDataLoader(execution_mode=ExecutionMode.DEMO)
+    
+    # Create test records
+    record1 = FilingRecord(
+        ticker="TEST", cik="0000000001", form_type="10-K",
+        filing_date="2024-01-01", accession_number="0000000001-24-000001",
+        period_end="2024-01-01", filed_at="2024-01-01",
+        risk_factors_text="Risk text", mda_text="MDA text",
+        execution_mode=ExecutionMode.DEMO,
+    )
+    record2 = FilingRecord(
+        ticker="TEST", cik="0000000001", form_type="10-K",
+        filing_date="2024-04-01", accession_number="0000000001-24-000002",
+        period_end="2024-04-01", filed_at="2024-04-01",
+        risk_factors_text="Risk text 2", mda_text="MDA text 2",
+        execution_mode=ExecutionMode.DEMO,
+    )
+    
+    # Write to cache
+    cache1 = CACHE_DIR / "TEST_0000000001-24-000001_10k.json"
+    cache2 = CACHE_DIR / "TEST_0000000001-24-000002_10k.json"
+    cache1.write_text(json.dumps(record1.to_dict()))
+    cache2.write_text(json.dumps(record2.to_dict()))
+    
+    try:
+        # Load by accession
+        loaded1 = loader.load_filing_by_accession("TEST", "0000000001-24-000001")
+        assert loaded1 is not None
+        assert loaded1.accession_number == "0000000001-24-000001"
+        assert loaded1.filing_date == "2024-01-01"
+        
+        loaded2 = loader.load_filing_by_accession("TEST", "0000000001-24-000002")
+        assert loaded2 is not None
+        assert loaded2.accession_number == "0000000001-24-000002"
+        assert loaded2.filing_date == "2024-04-01"
+        
+        # Non-existent
+        loaded_none = loader.load_filing_by_accession("TEST", "NONEXISTENT")
+        assert loaded_none is None
+    finally:
+        cache1.unlink(missing_ok=True)
+        cache2.unlink(missing_ok=True)
+
+
+def test_workspace_identity_changes_on_config() -> None:
+    """Test that workspace key includes execution mode and sentiment backend."""
+    from sec_nim_alpha.data_loader import FilingRecord
+    from sec_nim_alpha.schemas import SentimentResult
+    
+    record = FilingRecord(
+        ticker="TEST", cik="0000000001", form_type="10-K",
+        filing_date="2024-01-01", accession_number="0000000001-24-000001",
+        period_end="2024-01-01", filed_at="2024-01-01",
+        risk_factors_text="Risk", mda_text="MDA",
+        execution_mode=ExecutionMode.DEMO,
+    )
+    
+    sentiment1 = SentimentResult(
+        optimism_index=0.1, positive_ratio=0.3, negative_ratio=0.2, neutral_ratio=0.5,
+        analyzed_sentences=10, eligible_sentences=10, section_coverage={},
+        backend="finbert", model_version="ProsusAI/finbert",
+    )
+    
+    sentiment2 = SentimentResult(
+        optimism_index=0.1, positive_ratio=0.3, negative_ratio=0.2, neutral_ratio=0.5,
+        analyzed_sentences=10, eligible_sentences=10, section_coverage={},
+        backend="loughran_mcdonald_lexicon_v1", model_version="loughran_mcdonald_lexicon_v1",
+    )
+    
+    # Different backends should produce different keys
+    from app.main import _make_workspace_key
+    key1 = _make_workspace_key(record, "demo", sentiment1.backend)
+    key2 = _make_workspace_key(record, "demo", sentiment2.backend)
+    assert key1 != key2
+    
+    # Different execution modes should produce different keys
+    key3 = _make_workspace_key(record, "production", sentiment1.backend)
+    assert key1 != key3
