@@ -9,8 +9,21 @@ from sec_nim_alpha.schemas import ExecutionMode
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+# Use environment-configurable data root
+# Default to local project data/ for development, /app/data for Docker
+if os.getenv("SEC_NIM_DATA_DIR"):
+    DATA_ROOT = Path(os.getenv("SEC_NIM_DATA_DIR")).resolve()
+else:
+    # Check if running in Docker (common indicator: /app exists and is writable)
+    docker_data = Path("/app/data")
+    if docker_data.parent.exists() and os.access(docker_data.parent, os.W_OK):
+        DATA_ROOT = docker_data
+    else:
+        # Local development: use project-relative data directory
+        BASE_DIR = Path(__file__).resolve().parent.parent
+        DATA_ROOT = BASE_DIR / "data"
+
+DATA_DIR = DATA_ROOT
 CACHE_DIR = DATA_DIR / "cache"
 CHROMA_DIR = DATA_DIR / "chroma_db"
 RAW_FILINGS_DIR = DATA_DIR / "raw_filings"

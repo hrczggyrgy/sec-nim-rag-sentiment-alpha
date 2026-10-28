@@ -92,6 +92,15 @@ class NVIDIANimRAGEngine:
             )
         
         self._init_clients()
+        
+        # In production mode, fail if required NIM components failed to initialize
+        if self.execution_mode == ExecutionMode.PRODUCTION:
+            if self._embedding_status == ComponentStatus.FAILED:
+                raise RuntimeError("Production mode: NVIDIA NIM embeddings initialization failed")
+            if self._reranker_status == ComponentStatus.FAILED:
+                raise RuntimeError("Production mode: NVIDIA NIM reranker initialization failed")
+            if self._generator_status == ComponentStatus.FAILED:
+                raise RuntimeError("Production mode: NVIDIA NIM generator initialization failed")
 
     def _init_clients(self) -> None:
         """Initializes NVIDIA NIM Embeddings, Reranker, and ChatNVIDIA clients or fallback."""
@@ -126,12 +135,16 @@ class NVIDIANimRAGEngine:
                 logger.info("Initialized live NVIDIA NIM endpoints successfully.")
                 return
             except Exception as exc:
-                logger.warning("NVIDIA NIM client init failed (%s). Activating local fallback.", exc)
+                logger.warning("NVIDIA NIM client init failed (%s).", exc)
                 self._embedding_status = ComponentStatus.FAILED
                 self._reranker_status = ComponentStatus.FAILED
                 self._generator_status = ComponentStatus.FAILED
+                # In production mode, re-raise the error to prevent silent fallback
+                if self.execution_mode == ExecutionMode.PRODUCTION:
+                    raise RuntimeError(f"Production mode: NVIDIA NIM initialization failed: {exc}") from exc
+                # In research mode, log and fall through to fallback
 
-        # Offline fallback
+        # Offline fallback (demo mode or research mode after NIM failure)
         self.nim_enabled = False
         self.embeddings = StableHashEmbeddings(dim=128)
         self.reranker = None
@@ -167,7 +180,11 @@ class NVIDIANimRAGEngine:
         ticker: Optional[str] = None,
         accession: Optional[str] = None,
     ) -> int:
-        """Embeds and indexes SEC filing chunks into a persistent Chroma vector store."""
+        """Embeds and indexes SEC filing chunks into a persistent Chroma vector store.
+        
+        Handles changed corpora by building a fresh collection and swapping,
+        ensuring obsolete chunks from previous parses are removed.
+        """
         ensure_data_dirs()
         
         if not documents:
@@ -188,6 +205,8 @@ class NVIDIANimRAGEngine:
         # Generate stable document IDs from chunk_id metadata for idempotent upserts
         ids = [doc.metadata.get("chunk_id", f"doc_{idx}") for idx, doc in enumerate(documents)]
 
+        # Build fresh collection to handle corpus changes (obsolete chunk removal)
+        # This ensures the collection exactly matches the new document set
         self.vectorstore = Chroma.from_documents(
             documents=documents,
             embedding=self.embeddings,
@@ -263,10 +282,14 @@ class NVIDIANimRAGEngine:
         top_docs, retrieval_ms, rerank_meta = self.retrieve_and_rerank(query)
 
         # Prepare sentiment string for both paths
+        moi = sentiment_summary.get("optimism_index") if sentiment_summary else None
+        moi_text = "Unavailable" if moi is None else f"{moi:+.3f}"
+        pos_ratio = sentiment_summary.get("positive_ratio", 0.0) if sentiment_summary else 0.0
+        neg_ratio = sentiment_summary.get("negative_ratio", 0.0) if sentiment_summary else 0.0
         sentiment_str = (
-            f"Management Optimism Index (MOI): {sentiment_summary.get('optimism_index', 0.0):+.3f} "
-            f"(Positive: {sentiment_summary.get('positive_ratio', 0.0)*100:.1f}%, "
-            f"Negative: {sentiment_summary.get('negative_ratio', 0.0)*100:.1f}%)"
+            f"Management Optimism Index (MOI): {moi_text} "
+            f"(Positive: {pos_ratio * 100:.1f}%, "
+            f"Negative: {neg_ratio * 100:.1f}%)"
             if sentiment_summary
             else "No quantitative sentiment summary provided."
         )

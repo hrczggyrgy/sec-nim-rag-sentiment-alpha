@@ -60,6 +60,5 @@ htmlcov
 .ipynb_checkpoints
 
 # Lock files (we'll generate in builder)
-uv.lock
 poetry.lock
 Pipfile.lock

@@ -245,9 +245,32 @@ class FinancialFeaturePipeline:
                     raise ValueError(f"FinBERT returned {len(all_preds)} predictions for {len(sentences)} sentences")
                 
                 # Validate each prediction has valid probability distributions
+                required_labels = {"positive", "negative", "neutral"}
                 for preds in all_preds:
                     if not isinstance(preds, list) or len(preds) == 0:
                         raise ValueError("FinBERT returned invalid prediction format")
+                    
+                    # Check for exact required labels, no duplicates
+                    labels = [str(p.get("label", "")).lower() for p in preds]
+                    if set(labels) != required_labels:
+                        raise ValueError(f"FinBERT prediction missing required labels: got {set(labels)}")
+                    if len(labels) != len(set(labels)):
+                        raise ValueError("FinBERT prediction contains duplicate labels")
+                    
+                    # Check each probability is finite and in [0, 1]
+                    for p in preds:
+                        score = p.get("score")
+                        if score is None:
+                            raise ValueError("FinBERT prediction missing score")
+                        if not isinstance(score, (int, float)):
+                            raise ValueError(f"FinBERT score is not numeric: {score}")
+                        if not (0.0 <= score <= 1.0):
+                            raise ValueError(f"FinBERT probability out of bounds [0,1]: {score}")
+                        if not (score == score):  # NaN check
+                            raise ValueError("FinBERT probability is NaN")
+                        if score == float('inf') or score == float('-inf'):
+                            raise ValueError("FinBERT probability is infinite")
+                    
                     total_prob = sum(p.get("score", 0) for p in preds)
                     if abs(total_prob - 1.0) > 0.01:  # Allow small floating point error
                         raise ValueError(f"FinBERT probabilities don't sum to 1: {total_prob}")
@@ -279,9 +302,12 @@ class FinancialFeaturePipeline:
                 logger.warning("FinBERT inference failed (%s). Falling back to lexicon for all sentences.", exc)
                 clf = None
                 scored_items = []  # Clear any partial results
+                # Reset model version to lexicon since we're falling back
+                self._model_version = "loughran_mcdonald_lexicon_v1"
 
         if clf is None:
             # Lexicon fallback for all sentences
+            fallback_reason = "FinBERT model unavailable or validation failed"
             for sent, section in section_sentences:
                 probs, label, confidence = self._lexicon_score_sentence(sent)
                 scored_items.append(SentenceSentiment(
@@ -297,6 +323,7 @@ class FinancialFeaturePipeline:
                     model_version="loughran_mcdonald_lexicon_v1",
                 ))
             self._model_version = "loughran_mcdonald_lexicon_v1"
+            warnings.append(f"FinBERT inference unavailable; using lexicon fallback: {fallback_reason}")
 
         # Aggregate metrics using probability-weighted approach
         total = len(scored_items)

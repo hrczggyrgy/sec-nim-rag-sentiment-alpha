@@ -426,8 +426,9 @@ class SECDataLoader:
         mda_text = str(getattr(tenk_obj, "mda", "") or "")
 
         # If either section is too short, try full text extraction for both
+        # Use full text without arbitrary character limit
         if len(risk_text) < 200 or len(mda_text) < 200:
-            full_text = latest.text()[:100000]  # Cap at 100k chars
+            full_text = latest.text()  # No cap - store full original
             risk_ext, mda_ext = self._extract_sections(full_text)
             risk_text = risk_ext.content
             mda_text = mda_ext.content
@@ -449,8 +450,8 @@ class SECDataLoader:
                 parser_version="1.0.0",
             )
 
-        # Compute content hash for integrity (from full untruncated content)
-        combined_content = f"{risk_text}\n{mda_text}"
+        # Compute content hash for integrity (use same format as raw storage: double newline)
+        combined_content = f"{risk_text}\n\n{mda_text}"
         content_hash = compute_content_hash(combined_content)
 
         market_metrics = self.fetch_market_metrics(ticker, filing_date)
@@ -480,6 +481,7 @@ class SECDataLoader:
         )
         
         # Save raw filing with full untruncated content for integrity verification
+        # Use double newline separator to match content hash computation
         raw_file = RAW_FILINGS_DIR / f"{record.ticker}_{record.accession_number}_raw.txt"
         raw_content = f"{risk_text}\n\n{mda_text}"
         raw_file.write_text(raw_content, encoding="utf-8")
@@ -508,17 +510,21 @@ class SECDataLoader:
                         return name[len(prefix):-len(suffix)]
                     return ""
                 
-                # Sort by accession (which contains date info) descending
-                latest_cache = max(cached_files, key=lambda f: extract_accession(f))
+                # Filter out demo cache files (they have "DEMO" in accession position)
+                live_cache_files = [f for f in cached_files if extract_accession(f) and "DEMO" not in extract_accession(f)]
                 
-                # Try to load cache with corrupt cache recovery
-                try:
-                    logger.info("Loading cached 10-K filing for %s from %s", ticker, latest_cache)
-                    data = json.loads(latest_cache.read_text(encoding="utf-8"))
-                    return FilingRecord.from_dict(data)
-                except (json.JSONDecodeError, ValueError, KeyError) as exc:
-                    logger.warning("Corrupt cache file %s (%s); attempting live fetch", latest_cache, exc)
-                    # Fall through to live fetch
+                if live_cache_files:
+                    # Sort by accession (which contains date info) descending
+                    latest_cache = max(live_cache_files, key=lambda f: extract_accession(f))
+                    
+                    # Try to load cache with corrupt cache recovery
+                    try:
+                        logger.info("Loading cached 10-K filing for %s from %s", ticker, latest_cache)
+                        data = json.loads(latest_cache.read_text(encoding="utf-8"))
+                        return FilingRecord.from_dict(data)
+                    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                        logger.warning("Corrupt cache file %s (%s); attempting live fetch", latest_cache, exc)
+                        # Fall through to live fetch
 
         try:
             record = self._fetch_live_10k(ticker)
@@ -595,7 +601,7 @@ class SECDataLoader:
                 execution_mode=ExecutionMode.DEMO,
             )
 
-            # Cache demo separately
+            # Cache demo separately with explicit DEMO marker
             demo_cache_file = CACHE_DIR / f"{ticker}_DEMO_10k.json"
             demo_cache_file.write_text(json.dumps(record.to_dict(), indent=2), encoding="utf-8")
 

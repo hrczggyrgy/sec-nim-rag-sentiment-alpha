@@ -1,5 +1,6 @@
 """Interactive Streamlit Dashboard for SEC 10-K NVIDIA NIM RAG & FinBERT Volatility Analytics."""
 
+import pandas as pd
 import streamlit as st
 from sec_nim_alpha.config import CONFIG, ExecutionMode
 from sec_nim_alpha.data_loader import SECDataLoader
@@ -11,6 +12,7 @@ from sec_nim_alpha.utils import (
     create_execution_manifest_chart,
     set_request_id,
     compute_claim_level_support,
+    request_id_var,
 )
 from sec_nim_alpha.schemas import ComponentStatus
 
@@ -64,10 +66,8 @@ def run_full_pipeline(
     enable_finbert: bool,
     refresh: bool,
     execution_mode: ExecutionMode,
+    request_id: str,
 ):
-    # Set request ID for tracing (outside cache for uniqueness per call)
-    request_id = set_request_id()
-
     loader = SECDataLoader(execution_mode=execution_mode)
     record = loader.fetch_latest_10k(ticker, force_refresh=refresh)
     panel_df = loader.load_historical_panel(ticker)
@@ -103,7 +103,7 @@ def run_full_pipeline(
         ticker=record.ticker,
         accession=record.accession_number,
     )
-    return record, sentiment, panel_df, rag_engine, request_id
+    return record, sentiment, panel_df, rag_engine
 
 
 @st.cache_resource(show_spinner="Executing SEC EDGAR Ingestion, FinBERT Scoring, and Vector Indexing...")
@@ -114,20 +114,25 @@ def run_full_pipeline_cached(
     execution_mode: ExecutionMode,
 ):
     """Cached version without refresh - for non-refresh runs only."""
-    return run_full_pipeline(ticker, api_key, enable_finbert, False, execution_mode)
+    # Create a request ID for tracing (this will be the same for cached calls)
+    request_id = set_request_id()
+    return run_full_pipeline(ticker, api_key, enable_finbert, False, execution_mode, request_id)
 
 
 # Run pipeline
 if force_edgar_refresh or run_btn:
-    # Bypass cache for refresh
-    record, sentiment, panel_df, rag_engine, request_id = run_full_pipeline(
-        active_ticker, api_key_input, use_live_finbert, True, execution_mode
+    # Bypass cache for refresh - create new request ID for each refresh
+    request_id = set_request_id()
+    record, sentiment, panel_df, rag_engine = run_full_pipeline(
+        active_ticker, api_key_input, use_live_finbert, True, execution_mode, request_id
     )
 else:
-    # Use cached version
-    record, sentiment, panel_df, rag_engine, request_id = run_full_pipeline_cached(
+    # Use cached version - request_id is created inside cached function
+    record, sentiment, panel_df, rag_engine = run_full_pipeline_cached(
         active_ticker, api_key_input, use_live_finbert, execution_mode
     )
+    # Get the request_id that was set during the cached call
+    request_id = request_id_var.get() or set_request_id()
 
 # --- Header Metrics ---
 col1, col2, col3, col4 = st.columns(4)
